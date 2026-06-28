@@ -13,10 +13,12 @@ def preprocess(image_path: str, out_path: str) -> str:
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    # Smaller tiles = more local contrast boost → helps darkened/shaded cells
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16, 16))
     enhanced = clahe.apply(gray)
 
-    denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
+    # Light denoise only — aggressive denoising blurs low-contrast text
+    denoised = cv2.fastNlMeansDenoising(enhanced, h=5)
 
     # Scale up small images so OCR has more pixels to work with
     h, w = denoised.shape[:2]
