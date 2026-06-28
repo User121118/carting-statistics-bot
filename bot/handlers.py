@@ -10,7 +10,7 @@ from telegram.ext import ContextTypes, ConversationHandler
 
 import db.repository as repo
 from bot.keyboards import confirm, kart_numbers, main_menu
-from bot.states import CONFIRM_RESULT, SELECT_KART
+from bot.states import CONFIRM_RESULT, EDIT_LAP, SELECT_KART
 from db.models import RaceResult
 from ocr.parser import parse_race_photo
 
@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 
 def _fmt_time(t) -> str:
     return f"{t:.3f} с" if t is not None else "—"
+
+
+def _recalc(participant: dict) -> None:
+    """Recalculate best_lap and avg_lap from current lap_times."""
+    valid = [t for t in participant["lap_times"] if t is not None]
+    participant["best_lap"] = min(valid) if valid else None
+    participant["avg_lap"] = round(sum(valid) / len(valid), 3) if valid else None
 
 
 def _format_result(result: RaceResult, title: str) -> str:
@@ -121,7 +128,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         tmp_path = tmp.name
 
     try:
-        # OCR is CPU-heavy — run in thread pool to not block the event loop
         race_data = await asyncio.to_thread(parse_race_photo, tmp_path)
     finally:
         os.unlink(tmp_path)
@@ -188,6 +194,9 @@ async def handle_confirmation(
 
     answer = query.data.split(":", 1)[1]
 
+    if answer == "edit":
+        return await _show_edit_prompt(query, context)
+
     if answer == "no":
         context.user_data.clear()
         await query.edit_message_text("Отменено.")
@@ -226,3 +235,80 @@ async def handle_confirmation(
     await query.edit_message_text("✅ Результат сохранён!")
     await query.message.reply_text("Что дальше?", reply_markup=main_menu())
     return ConversationHandler.END
+
+
+# ── Edit flow ──────────────────────────────────────────────────────────────────
+
+async def _show_edit_prompt(query, context: ContextTypes.DEFAULT_TYPE) -> int:
+    participant = context.user_data.get("selected_participant")
+    laps = participant.get("lap_times") or []
+
+    laps_str = "\n".join(
+        f"  Круг {i + 1}: {_fmt_time(t)}"
+        for i, t in enumerate(laps)
+    )
+    await query.edit_message_text(
+        f"Текущие круги:\n{laps_str}\n\n"
+        "Введите номер круга и время через пробел:\n"
+        "`7 44.658`\n\n"
+        "Чтобы добавить новый круг — введите следующий номер.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return EDIT_LAP
+
+
+async def handle_edit_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    parts = update.message.text.strip().split()
+
+    if len(parts) != 2:
+        await update.message.reply_text(
+            "Неверный формат. Введите номер круга и время:\n`7 44.658`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return EDIT_LAP
+
+    try:
+        lap_num = int(parts[0])
+        lap_time = float(parts[1].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text(
+            "Не удалось разобрать значения. Пример: `7 44.658`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return EDIT_LAP
+
+    if lap_num < 1:
+        await update.message.reply_text("Номер круга должен быть больше 0.")
+        return EDIT_LAP
+
+    if lap_time <= 0:
+        await update.message.reply_text("Время должно быть положительным числом.")
+        return EDIT_LAP
+
+    participant = context.user_data.get("selected_participant")
+    race_data = context.user_data.get("pending_race")
+
+    if not participant or not race_data:
+        await update.message.reply_text(
+            "Сессия устарела. Отправьте фото заново.",
+            reply_markup=main_menu(),
+        )
+        return ConversationHandler.END
+
+    lap_times = participant["lap_times"]
+
+    # Extend list with None if the new lap is beyond current length
+    while len(lap_times) < lap_num:
+        lap_times.append(None)
+
+    lap_times[lap_num - 1] = lap_time
+    _recalc(participant)
+
+    await update.message.reply_text(
+        _format_participant(participant, race_data),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=confirm(),
+    )
+    return CONFIRM_RESULT

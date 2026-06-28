@@ -19,6 +19,9 @@ def confirm() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("✅ Сохранить", callback_data="confirm:yes"),
                 InlineKeyboardButton("❌ Отмена", callback_data="confirm:no"),
-            ]
+            ],
+            [
+                InlineKeyboardButton("✏️ Редактировать круг", callback_data="confirm:edit"),
+            ],
         ]
     )

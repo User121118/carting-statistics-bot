@@ -15,12 +15,13 @@ from bot.handlers import (
     cmd_cancel,
     cmd_start,
     handle_confirmation,
+    handle_edit_input,
     handle_kart_selection,
     handle_photo,
     my_best_result,
     my_last_race,
 )
-from bot.states import CONFIRM_RESULT, SELECT_KART
+from bot.states import CONFIRM_RESULT, EDIT_LAP, SELECT_KART
 from db.repository import init_db
 
 logging.basicConfig(
@@ -59,6 +60,9 @@ def main() -> None:
             ],
             CONFIRM_RESULT: [
                 CallbackQueryHandler(handle_confirmation, pattern=r"^confirm:"),
+            ],
+            EDIT_LAP: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_input),
             ],
         },
         fallbacks=[
