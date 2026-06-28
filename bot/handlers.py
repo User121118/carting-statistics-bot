@@ -10,7 +10,7 @@ from telegram.ext import ContextTypes, ConversationHandler
 
 import db.repository as repo
 from bot.keyboards import confirm, kart_numbers, main_menu
-from bot.states import CONFIRM_RESULT, EDIT_LAP, SELECT_KART
+from bot.states import CONFIRM_RESULT, EDIT_LAP, SELECT_KART, SET_NAME
 from db.models import RaceResult
 from ocr.parser import parse_race_photo
 
@@ -30,14 +30,16 @@ def _recalc(participant: dict) -> None:
     participant["avg_lap"] = round(sum(valid) / len(valid), 3) if valid else None
 
 
-def _format_result(result: RaceResult, title: str) -> str:
+def _format_result(result: RaceResult, title: str, racer_name: Optional[str] = None) -> str:
     laps = result.lap_times or []
     laps_str = "\n".join(
         f"  Круг {i + 1}: {_fmt_time(t)}"
         for i, t in enumerate(laps)
     )
+    name_line = f"👤 Гонщик: *{racer_name}*\n" if racer_name else ""
     return (
         f"🏁 *{title}*\n\n"
+        f"{name_line}"
         f"🛺 Карт: `{result.kart_number}`\n"
         f"🏆 Позиция: {result.position or '—'}\n"
         f"⚡ Лучший круг: `{_fmt_time(result.best_lap)}`\n"
@@ -85,15 +87,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ── Menu buttons ───────────────────────────────────────────────────────────────
 
 async def my_last_race(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    result = await repo.get_last_result(update.effective_user.id)
+    tg_id = update.effective_user.id
+    user = await repo.get_user(tg_id)
+    result = await repo.get_last_result(tg_id)
     if not result:
         await update.message.reply_text(
             "У вас ещё нет сохранённых результатов.\nОтправьте фото заезда!",
             reply_markup=main_menu(),
         )
         return ConversationHandler.END
+    name = user.racer_name if user and user.racer_name else None
     await update.message.reply_text(
-        _format_result(result, "Последний заезд"),
+        _format_result(result, "Последний заезд", name),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu(),
     )
@@ -101,15 +106,18 @@ async def my_last_race(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def my_best_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    result = await repo.get_best_result(update.effective_user.id)
+    tg_id = update.effective_user.id
+    user = await repo.get_user(tg_id)
+    result = await repo.get_best_result(tg_id)
     if not result:
         await update.message.reply_text(
             "У вас ещё нет сохранённых результатов.\nОтправьте фото заезда!",
             reply_markup=main_menu(),
         )
         return ConversationHandler.END
+    name = user.racer_name if user and user.racer_name else None
     await update.message.reply_text(
-        _format_result(result, "Лучший результат"),
+        _format_result(result, "Лучший результат", name),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu(),
     )
@@ -239,6 +247,66 @@ async def handle_confirmation(
     context.user_data.clear()
     await query.edit_message_text("✅ Результат сохранён!")
     await query.message.reply_text("Что дальше?", reply_markup=main_menu())
+    return ConversationHandler.END
+
+
+# ── Top 5 ─────────────────────────────────────────────────────────────────────
+
+async def top5_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    from datetime import datetime
+    rows = await repo.get_top5_month()
+
+    if not rows:
+        await update.message.reply_text(
+            "В этом месяце ещё нет сохранённых результатов.",
+            reply_markup=main_menu(),
+        )
+        return ConversationHandler.END
+
+    month = datetime.utcnow().strftime("%B %Y")
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    lines = []
+    for i, row in enumerate(rows):
+        name = row.racer_name or row.first_name or "Гонщик"
+        lines.append(f"{medals[i]} {name} — `{row.top_lap:.3f} с`")
+
+    await update.message.reply_text(
+        f"🏆 *Топ 5 гонщиков — {month}*\n\n" + "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu(),
+    )
+    return ConversationHandler.END
+
+
+# ── Name flow ──────────────────────────────────────────────────────────────────
+
+async def handle_name_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = await repo.get_user(update.effective_user.id)
+    current = user.racer_name if user and user.racer_name else "не указано"
+    await update.message.reply_text(
+        f"Текущее имя гонщика: *{current}*\n\nВведите новое имя:",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return SET_NAME
+
+
+async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+
+    if not name:
+        await update.message.reply_text("Имя не может быть пустым. Попробуйте ещё раз:")
+        return SET_NAME
+
+    if len(name) > 50:
+        await update.message.reply_text("Имя слишком длинное (максимум 50 символов):")
+        return SET_NAME
+
+    await repo.set_racer_name(update.effective_user.id, name)
+    await update.message.reply_text(
+        f"✅ Имя гонщика сохранено: *{name}*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu(),
+    )
     return ConversationHandler.END
 
 

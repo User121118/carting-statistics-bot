@@ -3,7 +3,12 @@ from telegram import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardBu
 
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["🏁 Мой последний заезд"], ["🏆 Мой лучший результат"]],
+        [
+            ["🏁 Мой последний заезд"],
+            ["🏆 Мой лучший результат"],
+            ["🥇 Топ 5 месяца"],
+            ["👤 Моё имя"],
+        ],
         resize_keyboard=True,
     )
 

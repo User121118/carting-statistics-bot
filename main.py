@@ -17,11 +17,14 @@ from bot.handlers import (
     handle_confirmation,
     handle_edit_input,
     handle_kart_selection,
+    handle_name_input,
+    handle_name_menu,
     handle_photo,
     my_best_result,
     my_last_race,
+    top5_month,
 )
-from bot.states import CONFIRM_RESULT, EDIT_LAP, SELECT_KART
+from bot.states import CONFIRM_RESULT, EDIT_LAP, SELECT_KART, SET_NAME
 from db.repository import init_db
 
 logging.basicConfig(
@@ -32,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 MENU_LAST = filters.Regex("^🏁 Мой последний заезд$")
 MENU_BEST = filters.Regex("^🏆 Мой лучший результат$")
+MENU_TOP5 = filters.Regex("^🥇 Топ 5 месяца$")
+MENU_NAME = filters.Regex("^👤 Моё имя$")
 
 
 async def post_init(app: Application) -> None:
@@ -53,6 +58,8 @@ def main() -> None:
             MessageHandler(filters.PHOTO, handle_photo),
             MessageHandler(MENU_LAST, my_last_race),
             MessageHandler(MENU_BEST, my_best_result),
+            MessageHandler(MENU_TOP5, top5_month),
+            MessageHandler(MENU_NAME, handle_name_menu),
         ],
         states={
             SELECT_KART: [
@@ -64,10 +71,15 @@ def main() -> None:
             EDIT_LAP: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_input),
             ],
+            SET_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name_input),
+            ],
         },
         fallbacks=[
             MessageHandler(MENU_LAST, my_last_race),
             MessageHandler(MENU_BEST, my_best_result),
+            MessageHandler(MENU_TOP5, top5_month),
+            MessageHandler(MENU_NAME, handle_name_menu),
             CommandHandler("cancel", cmd_cancel),
             CommandHandler("start", cmd_start),
         ],

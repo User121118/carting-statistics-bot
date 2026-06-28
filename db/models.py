@@ -14,6 +14,7 @@ class User(Base):
     telegram_id = Column(BigInteger, unique=True, nullable=False, index=True)
     username = Column(String, nullable=True)
     first_name = Column(String, nullable=True)
+    racer_name = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     results = relationship("RaceResult", back_populates="user")
