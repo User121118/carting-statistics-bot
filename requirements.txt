@@ -1,5 +1,5 @@
 python-telegram-bot==20.7
-google-generativeai>=0.8.0
+groq>=0.9.0
 Pillow>=10.2.0
 sqlalchemy[asyncio]==2.0.25
 asyncpg==0.29.0
