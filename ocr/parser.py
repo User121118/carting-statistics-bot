@@ -93,6 +93,7 @@ def parse_race_photo(image_path: str) -> Optional[dict]:
         tables = doc.extract_tables(
             ocr=ocr,
             implicit_rows=False,
+            implicit_columns=False,
             borderless_tables=False,
         )
 
