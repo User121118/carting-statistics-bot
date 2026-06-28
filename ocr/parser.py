@@ -1,13 +1,16 @@
 """
-Parse a karting race-result photo into structured data.
+Parse a karting race-result photo using raw EasyOCR output.
 
-Table structure (columns = participants by place, rows = laps):
-  Row "Место"  : 1  2  3 ... 10   <- place headers
-  Row "Инд"    : participant identifier (may be empty)
-  Row "Номер"  : Взрослый 10 | Взрослый 8 | ...  <- kart numbers
-  Rows 1-N     : lap times per participant
+Instead of relying on img2table (which needs straight table lines),
+we cluster OCR bounding boxes into rows/columns by coordinate proximity.
+This works even on slightly angled photos.
+
+Table structure (columns = participants, rows = laps):
+  Row "Место"  : 1  2  3 ...     <- place numbers
+  Row "Номер"  : Взрослый 10 | Взрослый 8 | ...
+  Rows 1-N     : lap times
   Row "Отстав.": gap to leader
-  Row "Средн." : average lap time
+  Row "Средн." : average lap
 """
 import logging
 import os
@@ -20,19 +23,92 @@ from ocr.preprocessor import preprocess
 
 logger = logging.getLogger(__name__)
 
-_ocr_engine = None
+_reader = None
 
 
-def _get_ocr():
-    global _ocr_engine
-    if _ocr_engine is None:
-        from img2table.ocr import EasyOCR as Img2EasyOCR
-        _ocr_engine = Img2EasyOCR(lang=["ru", "en"])
-    return _ocr_engine
+def _get_reader():
+    global _reader
+    if _reader is None:
+        import easyocr
+        _reader = easyocr.Reader(["ru", "en"], gpu=False)
+    return _reader
 
+
+# ── Geometry helpers ───────────────────────────────────────────────────────────
+
+def _cy(bbox) -> float:
+    """Y center of a bounding box [[x,y], ...]."""
+    return sum(p[1] for p in bbox) / len(bbox)
+
+
+def _cx(bbox) -> float:
+    """X center of a bounding box."""
+    return sum(p[0] for p in bbox) / len(bbox)
+
+
+def _height(bbox) -> float:
+    ys = [p[1] for p in bbox]
+    return max(ys) - min(ys)
+
+
+# ── Row / column clustering ────────────────────────────────────────────────────
+
+def _cluster_rows(detections: list, tolerance_ratio: float = 0.7) -> list[list]:
+    """
+    Group (bbox, text, conf) detections into rows by Y-center proximity.
+    tolerance_ratio: fraction of avg char height used as row-merge threshold.
+    Returns list of rows, each row sorted left→right.
+    """
+    if not detections:
+        return []
+
+    avg_h = sum(_height(d[0]) for d in detections) / len(detections) or 20
+    tol = avg_h * tolerance_ratio
+
+    by_y = sorted(detections, key=lambda d: _cy(d[0]))
+
+    rows: list[list] = []
+    cur = [by_y[0]]
+    cur_y = _cy(by_y[0][0])
+
+    for det in by_y[1:]:
+        y = _cy(det[0])
+        if abs(y - cur_y) <= tol:
+            cur.append(det)
+        else:
+            rows.append(sorted(cur, key=lambda d: _cx(d[0])))
+            cur = [det]
+            cur_y = y
+
+    rows.append(sorted(cur, key=lambda d: _cx(d[0])))
+    return rows
+
+
+def _assign_to_column(item_x: float, col_centers: list[float]) -> Optional[int]:
+    """
+    Return index of the nearest column center, or None if too far away.
+    Tolerance = half the minimum gap between adjacent columns.
+    """
+    if not col_centers:
+        return None
+
+    sorted_cx = sorted(col_centers)
+    if len(sorted_cx) > 1:
+        gaps = [sorted_cx[i + 1] - sorted_cx[i] for i in range(len(sorted_cx) - 1)]
+        tol = min(gaps) * 0.55
+    else:
+        tol = 150  # single column fallback
+
+    nearest_idx = min(range(len(col_centers)), key=lambda i: abs(col_centers[i] - item_x))
+    if abs(col_centers[nearest_idx] - item_x) <= tol:
+        return nearest_idx
+    return None
+
+
+# ── Time parsing ───────────────────────────────────────────────────────────────
 
 def parse_time(raw: str) -> Optional[float]:
-    """Convert '44.530' or '1:04.530' to total seconds."""
+    """Convert '44.530' or '1:04.530' → seconds."""
     s = (raw or "").strip().replace(",", ".")
     m = re.match(r"^(\d+):(\d+\.\d+)$", s)
     if m:
@@ -43,26 +119,23 @@ def parse_time(raw: str) -> Optional[float]:
     return None
 
 
-def _cell(value) -> str:
-    """Stringify a DataFrame cell, treating nan/None as empty."""
-    s = str(value).strip()
-    return "" if s.lower() in ("nan", "none", "") else s
+# ── Metadata extraction ────────────────────────────────────────────────────────
 
-
-def _extract_metadata(raw_texts: list) -> dict:
-    """Pull race number, date/time and venue from raw easyocr detections."""
+def _extract_metadata(rows: list) -> dict:
     meta = {"race_number": None, "start_time": None, "start_time_dt": None, "venue": None}
-    full = " ".join(t[1] for t in raw_texts if len(t) > 1)
 
-    venue_match = re.search(r"([А-ЯЁа-яё][\w\s]{5,}картинг[\w\s]*)", full, re.IGNORECASE)
-    if venue_match:
-        meta["venue"] = venue_match.group(1).strip()
+    # Use all text from the top 15 rows for header info
+    header_text = " ".join(d[1] for row in rows[:15] for d in row)
 
-    rn = re.search(r"заезд\s*[№#]?\s*(\d+)", full, re.IGNORECASE)
+    venue = re.search(r"([А-ЯЁа-яё][\w\s]{5,}картинг[\w\s]*)", header_text, re.IGNORECASE)
+    if venue:
+        meta["venue"] = venue.group(1).strip()
+
+    rn = re.search(r"заезд\s*[№#]?\s*(\d+)", header_text, re.IGNORECASE)
     if rn:
         meta["race_number"] = int(rn.group(1))
 
-    dt = re.search(r"(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2}:\d{2})", full)
+    dt = re.search(r"(\d{2}\.\d{2}\.\d{4})\s*(\d{2}:\d{2}:\d{2})", header_text)
     if dt:
         meta["start_time"] = f"{dt.group(1)} {dt.group(2)}"
         try:
@@ -73,51 +146,109 @@ def _extract_metadata(raw_texts: list) -> dict:
     return meta
 
 
+# ── Participant parsing ────────────────────────────────────────────────────────
+
+def _parse_participants(rows: list) -> list:
+    # Find the row with kart labels ("Взрослый 10", "Детский 8", …)
+    kart_row_idx = None
+    for idx, row in enumerate(rows):
+        row_text = " ".join(d[1] for d in row)
+        if re.search(r"взрослый|детский|карт", row_text, re.IGNORECASE):
+            kart_row_idx = idx
+            break
+
+    if kart_row_idx is None:
+        logger.warning("Kart number row not found")
+        return []
+
+    kart_row = rows[kart_row_idx]
+
+    # Collect participant columns: skip generic header cells
+    participants: list[dict] = []
+    col_centers: list[float] = []
+
+    for det in kart_row:
+        label = det[1].strip()
+        if re.match(r"^(номер|место|инд\.?)$", label, re.IGNORECASE):
+            continue
+        if not label:
+            continue
+        col_centers.append(_cx(det[0]))
+        participants.append({
+            "kart_number": label,
+            "position": None,
+            "lap_times": [],
+            "best_lap": None,
+            "avg_lap": None,
+        })
+
+    if not participants:
+        logger.warning("No participant columns found in kart row")
+        return []
+
+    # Collect lap times from subsequent rows
+    for row in rows[kart_row_idx + 1:]:
+        row_text = " ".join(d[1] for d in row)
+
+        # Stop at summary rows
+        if re.search(r"отстав|средн", row_text, re.IGNORECASE):
+            break
+
+        # Only process rows whose first token is a lap number
+        first = row[0][1].strip() if row else ""
+        if not re.match(r"^\d+$", first):
+            continue
+
+        # Assign each token to the nearest participant column
+        for det in row[1:]:
+            col_idx = _assign_to_column(_cx(det[0]), col_centers)
+            if col_idx is not None:
+                participants[col_idx]["lap_times"].append(parse_time(det[1].strip()))
+
+    # Calculate best / avg, assign positions
+    for p in participants:
+        valid = [t for t in p["lap_times"] if t is not None]
+        if valid:
+            p["best_lap"] = min(valid)
+            p["avg_lap"] = round(sum(valid) / len(valid), 3)
+
+    ranked = sorted(participants, key=lambda p: p["best_lap"] or float("inf"))
+    for pos, p in enumerate(ranked, 1):
+        p["position"] = pos
+
+    return participants
+
+
+# ── Main entry point ───────────────────────────────────────────────────────────
+
 def parse_race_photo(image_path: str) -> Optional[dict]:
     """
-    Main entry point. Returns structured race data or None on failure.
-    This is a CPU-heavy synchronous function — call via asyncio.to_thread().
+    CPU-heavy synchronous function — call via asyncio.to_thread() from async code.
+    Returns structured race data or None on failure.
     """
     processed_path = None
     try:
-        from img2table.document import Image as Img2Image
-
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             processed_path = tmp.name
 
         preprocess(image_path, processed_path)
 
-        ocr = _get_ocr()
-        doc = Img2Image(src=processed_path)
+        reader = _get_reader()
+        raw = reader.readtext(processed_path, detail=1, paragraph=False)
 
-        tables = doc.extract_tables(
-            ocr=ocr,
-            implicit_rows=False,
-            implicit_columns=False,
-            borderless_tables=False,
-        )
+        # Filter very low-confidence detections
+        detections = [(bbox, text, conf) for bbox, text, conf in raw if conf > 0.25]
 
-        raw_texts: list = []
-        try:
-            raw_texts = ocr.reader.readtext(processed_path)
-        except Exception:
-            pass
-
-        meta = _extract_metadata(raw_texts)
-
-        if not tables:
-            logger.warning("No tables found in image")
+        if not detections:
+            logger.warning("EasyOCR returned no detections")
             return None
 
-        main_table = max(tables, key=lambda t: t.df.shape[1])
+        rows = _cluster_rows(detections)
+        meta = _extract_metadata(rows)
+        participants = _parse_participants(rows)
 
-        # Reset to integer-based indexing so iloc works regardless of header detection
-        df = main_table.df.copy()
-        df.columns = range(len(df.columns))
-        df = df.reset_index(drop=True)
-
-        participants = _parse_participants(df)
         if not participants:
+            logger.warning("No participants parsed from rows")
             return None
 
         return {**meta, "participants": participants}
@@ -129,67 +260,3 @@ def parse_race_photo(image_path: str) -> Optional[dict]:
     finally:
         if processed_path and os.path.exists(processed_path):
             os.unlink(processed_path)
-
-
-def _parse_participants(df) -> list:
-    """Extract participant data from the race results DataFrame."""
-    kart_row_idx = None
-    for idx in range(len(df)):
-        row_text = " ".join(_cell(v) for v in df.iloc[idx].values)
-        # Match Cyrillic kart labels or generic "Номер" header
-        if re.search(r"взрослый|детский|карт|номер", row_text, re.IGNORECASE):
-            kart_row_idx = idx
-            break
-
-    if kart_row_idx is None:
-        logger.warning("Could not find kart number row in table")
-        return []
-
-    kart_row = df.iloc[kart_row_idx]
-
-    col_to_participant: dict = {}
-    for col_idx, val in enumerate(kart_row):
-        label = _cell(val)
-        # Skip header/label cells in the first column
-        if label and not re.search(r"^(номер|место|инд)$", label, re.IGNORECASE):
-            col_to_participant[col_idx] = {
-                "kart_number": label,
-                "position": None,
-                "lap_times": [],
-                "best_lap": None,
-                "avg_lap": None,
-            }
-
-    if not col_to_participant:
-        return []
-
-    for idx in range(kart_row_idx + 1, len(df)):
-        row = df.iloc[idx]
-        first = _cell(row.iloc[0])
-
-        if re.match(r"отстав|средн|gap|avg", first, re.IGNORECASE):
-            break
-
-        if not re.match(r"^\d+$", first):
-            continue
-
-        for col_idx, participant in col_to_participant.items():
-            if col_idx < len(row):
-                t = parse_time(_cell(row.iloc[col_idx]))
-                participant["lap_times"].append(t)
-
-    for p in col_to_participant.values():
-        valid = [t for t in p["lap_times"] if t is not None]
-        if valid:
-            p["best_lap"] = min(valid)
-            p["avg_lap"] = round(sum(valid) / len(valid), 3)
-
-    participants = list(col_to_participant.values())
-    ranked = sorted(
-        participants,
-        key=lambda p: p["best_lap"] if p["best_lap"] is not None else float("inf"),
-    )
-    for pos, p in enumerate(ranked, 1):
-        p["position"] = pos
-
-    return participants
