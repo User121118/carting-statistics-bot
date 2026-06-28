@@ -145,6 +145,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return ConversationHandler.END
 
+    # Use photo send time as the authoritative race date
+    msg_dt = update.message.date.replace(tzinfo=None)
+    race_data["start_time_dt"] = msg_dt
+    race_data["start_time"] = msg_dt.strftime("%d.%m.%Y %H:%M")
+
     context.user_data["pending_race"] = race_data
 
     numbers = [p["kart_number"] for p in race_data["participants"]]
