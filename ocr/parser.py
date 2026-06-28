@@ -236,8 +236,8 @@ def parse_race_photo(image_path: str) -> Optional[dict]:
         reader = _get_reader()
         raw = reader.readtext(processed_path, detail=1, paragraph=False)
 
-        # Filter very low-confidence detections
-        detections = [(bbox, text, conf) for bbox, text, conf in raw if conf > 0.25]
+        # Lower threshold captures shaded/highlighted cells that OCR is less confident about
+        detections = [(bbox, text, conf) for bbox, text, conf in raw if conf > 0.15]
 
         if not detections:
             logger.warning("EasyOCR returned no detections")
