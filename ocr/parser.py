@@ -1,216 +1,113 @@
 """
-Parse a karting race-result photo using raw EasyOCR output.
-
-Instead of relying on img2table (which needs straight table lines),
-we cluster OCR bounding boxes into rows/columns by coordinate proximity.
-This works even on slightly angled photos.
-
-Table structure (columns = participants, rows = laps):
-  Row "Место"  : 1  2  3 ...     <- place numbers
-  Row "Номер"  : Взрослый 10 | Взрослый 8 | ...
-  Rows 1-N     : lap times
-  Row "Отстав.": gap to leader
-  Row "Средн." : average lap
+Parse a karting race-result photo using Google Gemini Vision API.
+Replaces the local EasyOCR pipeline — handles shaded cells, angles, and
+digit ambiguity that local OCR struggled with.
 """
+import json
 import logging
-import os
-import re
-import tempfile
 from datetime import datetime
 from typing import Optional
 
-from ocr.preprocessor import preprocess
+import google.generativeai as genai
+from PIL import Image
+
+import config
 
 logger = logging.getLogger(__name__)
 
-_reader = None
+genai.configure(api_key=config.GEMINI_API_KEY)
+_model = genai.GenerativeModel("gemini-2.0-flash")
+
+_PROMPT = """Ты парсер результатов картингового заезда.
+На фото таблица. Извлеки данные и верни ТОЛЬКО валидный JSON без пояснений.
+
+Структура таблицы:
+- Строка "Место": номера позиций колонок (1, 2, 3…)
+- Строка "Номер": тип карта для каждой колонки ("Взрослый 10", "Взрослый 8" и т.д.)
+- Строки 1..N: времена кругов участников
+- Строка "Отстав.": отставание — игнорируй
+- Строка "Средн.": среднее — игнорируй
+
+Заголовок над таблицей может содержать название площадки, номер заезда и время старта.
+
+Верни JSON строго такой структуры:
+{
+  "race_number": <целое число или null>,
+  "start_time": "<DD.MM.YYYY HH:MM:SS> или null",
+  "venue": "<название площадки> или null",
+  "participants": [
+    {
+      "kart_number": "<название карта, например Взрослый 10>",
+      "lap_times": [<секунды float>, <секунды float>, ...]
+    }
+  ]
+}
+
+Правила:
+- Времена кругов — число секунд с точкой (44.658, не 44,658)
+- Если ячейка затемнена/закрашена — читай текст как обычно, фон игнорируй
+- Если ячейка пустая или нечитаема — используй null в массиве
+- Пустые колонки участников (без карта) не включай
+- ТОЛЬКО JSON, никакого другого текста"""
 
 
-def _get_reader():
-    global _reader
-    if _reader is None:
-        import easyocr
-        _reader = easyocr.Reader(["ru", "en"], gpu=False)
-    return _reader
-
-
-# ── Geometry helpers ───────────────────────────────────────────────────────────
-
-def _cy(bbox) -> float:
-    """Y center of a bounding box [[x,y], ...]."""
-    return sum(p[1] for p in bbox) / len(bbox)
-
-
-def _cx(bbox) -> float:
-    """X center of a bounding box."""
-    return sum(p[0] for p in bbox) / len(bbox)
-
-
-def _height(bbox) -> float:
-    ys = [p[1] for p in bbox]
-    return max(ys) - min(ys)
-
-
-# ── Row / column clustering ────────────────────────────────────────────────────
-
-def _cluster_rows(detections: list, tolerance_ratio: float = 0.7) -> list[list]:
+def parse_race_photo(image_path: str) -> Optional[dict]:
     """
-    Group (bbox, text, conf) detections into rows by Y-center proximity.
-    tolerance_ratio: fraction of avg char height used as row-merge threshold.
-    Returns list of rows, each row sorted left→right.
+    Parse race result photo via Gemini Vision.
+    Synchronous — call via asyncio.to_thread() from async handlers.
+    Returns structured dict or None on failure.
     """
-    if not detections:
-        return []
+    try:
+        img = Image.open(image_path)
 
-    avg_h = sum(_height(d[0]) for d in detections) / len(detections) or 20
-    tol = avg_h * tolerance_ratio
+        response = _model.generate_content(
+            [img, _PROMPT],
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0,
+            ),
+        )
 
-    by_y = sorted(detections, key=lambda d: _cy(d[0]))
+        data = json.loads(response.text.strip())
 
-    rows: list[list] = []
-    cur = [by_y[0]]
-    cur_y = _cy(by_y[0][0])
+        participants = _build_participants(data.get("participants") or [])
+        if not participants:
+            logger.warning("Gemini returned no participants")
+            return None
 
-    for det in by_y[1:]:
-        y = _cy(det[0])
-        if abs(y - cur_y) <= tol:
-            cur.append(det)
-        else:
-            rows.append(sorted(cur, key=lambda d: _cx(d[0])))
-            cur = [det]
-            cur_y = y
+        return {
+            "race_number": data.get("race_number"),
+            "start_time": data.get("start_time"),
+            "start_time_dt": _parse_dt(data.get("start_time")),
+            "venue": data.get("venue"),
+            "participants": participants,
+        }
 
-    rows.append(sorted(cur, key=lambda d: _cx(d[0])))
-    return rows
-
-
-def _assign_to_column(item_x: float, col_centers: list[float]) -> Optional[int]:
-    """
-    Return index of the nearest column center, or None if too far away.
-    Tolerance = half the minimum gap between adjacent columns.
-    """
-    if not col_centers:
+    except Exception:
+        logger.exception("parse_race_photo failed")
         return None
 
-    sorted_cx = sorted(col_centers)
-    if len(sorted_cx) > 1:
-        gaps = [sorted_cx[i + 1] - sorted_cx[i] for i in range(len(sorted_cx) - 1)]
-        tol = min(gaps) * 0.55
-    else:
-        tol = 150  # single column fallback
 
-    nearest_idx = min(range(len(col_centers)), key=lambda i: abs(col_centers[i] - item_x))
-    if abs(col_centers[nearest_idx] - item_x) <= tol:
-        return nearest_idx
-    return None
-
-
-# ── Time parsing ───────────────────────────────────────────────────────────────
-
-def parse_time(raw: str) -> Optional[float]:
-    """Convert '44.530' or '1:04.530' → seconds."""
-    s = (raw or "").strip().replace(",", ".")
-    m = re.match(r"^(\d+):(\d+\.\d+)$", s)
-    if m:
-        return int(m.group(1)) * 60 + float(m.group(2))
-    m = re.match(r"^(\d{1,3}\.\d{1,3})$", s)
-    if m:
-        return float(m.group(1))
-    return None
-
-
-# ── Metadata extraction ────────────────────────────────────────────────────────
-
-def _extract_metadata(rows: list) -> dict:
-    meta = {"race_number": None, "start_time": None, "start_time_dt": None, "venue": None}
-
-    # Use all text from the top 15 rows for header info
-    header_text = " ".join(d[1] for row in rows[:15] for d in row)
-
-    venue = re.search(r"([А-ЯЁа-яё][\w\s]{5,}картинг[\w\s]*)", header_text, re.IGNORECASE)
-    if venue:
-        meta["venue"] = venue.group(1).strip()
-
-    rn = re.search(r"заезд\s*[№#]?\s*(\d+)", header_text, re.IGNORECASE)
-    if rn:
-        meta["race_number"] = int(rn.group(1))
-
-    dt = re.search(r"(\d{2}\.\d{2}\.\d{4})\s*(\d{2}:\d{2}:\d{2})", header_text)
-    if dt:
-        meta["start_time"] = f"{dt.group(1)} {dt.group(2)}"
-        try:
-            meta["start_time_dt"] = datetime.strptime(meta["start_time"], "%d.%m.%Y %H:%M:%S")
-        except ValueError:
-            pass
-
-    return meta
-
-
-# ── Participant parsing ────────────────────────────────────────────────────────
-
-def _parse_participants(rows: list) -> list:
-    # Find the row with kart labels ("Взрослый 10", "Детский 8", …)
-    kart_row_idx = None
-    for idx, row in enumerate(rows):
-        row_text = " ".join(d[1] for d in row)
-        if re.search(r"взрослый|детский|карт", row_text, re.IGNORECASE):
-            kart_row_idx = idx
-            break
-
-    if kart_row_idx is None:
-        logger.warning("Kart number row not found")
-        return []
-
-    kart_row = rows[kart_row_idx]
-
-    # Collect participant columns: skip generic header cells
-    participants: list[dict] = []
-    col_centers: list[float] = []
-
-    for det in kart_row:
-        label = det[1].strip()
-        if re.match(r"^(номер|место|инд\.?)$", label, re.IGNORECASE):
+def _build_participants(raw: list) -> list:
+    participants = []
+    for p in raw:
+        kart = (p.get("kart_number") or "").strip()
+        if not kart:
             continue
-        if not label:
-            continue
-        col_centers.append(_cx(det[0]))
+
+        lap_times = [
+            float(t) if t is not None else None
+            for t in (p.get("lap_times") or [])
+        ]
+        valid = [t for t in lap_times if t is not None]
+
         participants.append({
-            "kart_number": label,
+            "kart_number": kart,
             "position": None,
-            "lap_times": [],
-            "best_lap": None,
-            "avg_lap": None,
+            "lap_times": lap_times,
+            "best_lap": min(valid) if valid else None,
+            "avg_lap": round(sum(valid) / len(valid), 3) if valid else None,
         })
-
-    if not participants:
-        logger.warning("No participant columns found in kart row")
-        return []
-
-    # Collect lap times from subsequent rows
-    for row in rows[kart_row_idx + 1:]:
-        row_text = " ".join(d[1] for d in row)
-
-        # Stop at summary rows
-        if re.search(r"отстав|средн", row_text, re.IGNORECASE):
-            break
-
-        # Only process rows whose first token is a lap number
-        first = row[0][1].strip() if row else ""
-        if not re.match(r"^\d+$", first):
-            continue
-
-        # Assign each token to the nearest participant column
-        for det in row[1:]:
-            col_idx = _assign_to_column(_cx(det[0]), col_centers)
-            if col_idx is not None:
-                participants[col_idx]["lap_times"].append(parse_time(det[1].strip()))
-
-    # Calculate best / avg, assign positions
-    for p in participants:
-        valid = [t for t in p["lap_times"] if t is not None]
-        if valid:
-            p["best_lap"] = min(valid)
-            p["avg_lap"] = round(sum(valid) / len(valid), 3)
 
     ranked = sorted(participants, key=lambda p: p["best_lap"] or float("inf"))
     for pos, p in enumerate(ranked, 1):
@@ -219,44 +116,10 @@ def _parse_participants(rows: list) -> list:
     return participants
 
 
-# ── Main entry point ───────────────────────────────────────────────────────────
-
-def parse_race_photo(image_path: str) -> Optional[dict]:
-    """
-    CPU-heavy synchronous function — call via asyncio.to_thread() from async code.
-    Returns structured race data or None on failure.
-    """
-    processed_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            processed_path = tmp.name
-
-        preprocess(image_path, processed_path)
-
-        reader = _get_reader()
-        raw = reader.readtext(processed_path, detail=1, paragraph=False)
-
-        # Lower threshold captures shaded/highlighted cells that OCR is less confident about
-        detections = [(bbox, text, conf) for bbox, text, conf in raw if conf > 0.15]
-
-        if not detections:
-            logger.warning("EasyOCR returned no detections")
-            return None
-
-        rows = _cluster_rows(detections)
-        meta = _extract_metadata(rows)
-        participants = _parse_participants(rows)
-
-        if not participants:
-            logger.warning("No participants parsed from rows")
-            return None
-
-        return {**meta, "participants": participants}
-
-    except Exception:
-        logger.exception("parse_race_photo failed")
+def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
         return None
-
-    finally:
-        if processed_path and os.path.exists(processed_path):
-            os.unlink(processed_path)
+    try:
+        return datetime.strptime(s, "%d.%m.%Y %H:%M:%S")
+    except ValueError:
+        return None

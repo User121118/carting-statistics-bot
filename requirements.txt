@@ -1,13 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.1.2+cpu
-torchvision==0.16.2+cpu
-
 python-telegram-bot==20.7
-easyocr==1.7.1
-opencv-python-headless==4.9.0.80
-Pillow==10.2.0
-pandas==2.2.0
-numpy>=1.26.3,<2.0
+google-generativeai>=0.8.0
+Pillow>=10.2.0
 sqlalchemy[asyncio]==2.0.25
 asyncpg==0.29.0
 python-dotenv==1.0.0
